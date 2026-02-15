@@ -316,9 +316,13 @@ const { Client } = nativeBinding
 const { decodeBuffer } = require('./decode.js');
 const _queryRaw = Client.prototype.queryRaw;
 
-Client.prototype.query = async function(sql, params) {
-  const buf = await _queryRaw.call(this, sql, params);
-  return decodeBuffer(buf);
-};
+Object.defineProperty(Client.prototype, 'query', {
+  value: async function(sql, params) {
+    const buf = await _queryRaw.call(this, sql, params);
+    return decodeBuffer(buf);
+  },
+  writable: true,
+  configurable: true,
+});
 
 module.exports.Client = Client
