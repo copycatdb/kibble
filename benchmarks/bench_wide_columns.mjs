@@ -1,4 +1,4 @@
-import { Client } from '../index.js';
+import { Client } from '../lib.js';
 import { Connection, Request, TYPES } from 'tedious';
 
 const CONN_STR = 'Server=localhost,1433;Database=master;UID=sa;PWD=TestPass123!;TrustServerCertificate=yes';

@@ -1,4 +1,4 @@
-import { Client } from '../index.js';
+import { Client } from '../lib.js';
 import { Connection, Request, TYPES } from 'tedious';
 
 const CONN_STR = process.env.DB_CONNECTION_STRING

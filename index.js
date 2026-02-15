@@ -310,19 +310,16 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { Client } = nativeBinding
+const { Client: NativeClient } = nativeBinding
 
-// Wrap query with fast buffer-based path
 const { decodeBuffer } = require('./decode.js');
-const _queryRaw = Client.prototype.queryRaw;
 
-Object.defineProperty(Client.prototype, 'query', {
-  value: async function(sql, params) {
-    const buf = await _queryRaw.call(this, sql, params);
+// Wrap NativeClient so .query() uses the fast buffer path
+class Client extends NativeClient {
+  async query(sql, params) {
+    const buf = await this.queryRaw(sql, params);
     return decodeBuffer(buf);
-  },
-  writable: true,
-  configurable: true,
-});
+  }
+}
 
 module.exports.Client = Client

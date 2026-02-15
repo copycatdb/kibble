@@ -7,7 +7,7 @@ const CONN_STR = process.env.DB_CONNECTION_STRING
 let Client;
 
 beforeAll(async () => {
-  const mod = await import('../index.js');
+  const mod = await import('../lib.js');
   Client = mod.Client;
 });
 
