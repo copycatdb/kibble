@@ -1,6 +1,6 @@
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const { Client } = require('../index.js');
+const { Client } = require('../lib.js');
 const tedious = require('tedious');
 
 const CONN_STR = 'Server=localhost,1433;User Id=sa;Password=TestPass123!;TrustServerCertificate=true;Database=tempdb';
