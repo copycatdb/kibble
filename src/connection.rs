@@ -94,6 +94,242 @@ impl RowWriter for JsRowCollector {
     }
 }
 
+// ── Fast binary-encoded collector ───────────────────────────────────
+// Tags: 0=null, 1=false, 2=true, 3=f64, 4=i64(bigint), 5=string_ref, 6=bytes
+const TAG_NULL: u8 = 0;
+const TAG_FALSE: u8 = 1;
+const TAG_TRUE: u8 = 2;
+const TAG_F64: u8 = 3;
+const TAG_BIGINT: u8 = 4;
+const TAG_STRING_REF: u8 = 5;
+const TAG_BYTES: u8 = 6;
+
+struct FastRowCollector {
+    columns: Vec<Column>,
+    cols_per_row: usize,
+    rows_affected: i64,
+    row_count: usize,
+    // Cell data written directly to buffer
+    cell_buf: Vec<u8>,
+    // String interning
+    string_table: Vec<String>,
+    string_map: HashMap<String, u32>,
+}
+
+impl Default for FastRowCollector {
+    fn default() -> Self {
+        Self {
+            columns: Vec::new(),
+            cols_per_row: 0,
+            rows_affected: 0,
+            row_count: 0,
+            cell_buf: Vec::with_capacity(1024 * 1024),
+            string_table: Vec::with_capacity(4096),
+            string_map: HashMap::with_capacity(4096),
+        }
+    }
+}
+
+impl FastRowCollector {
+    #[inline(always)]
+    fn intern_string(&mut self, s: &str) -> u32 {
+        if let Some(&idx) = self.string_map.get(s) {
+            return idx;
+        }
+        let idx = self.string_table.len() as u32;
+        self.string_map.insert(s.to_owned(), idx);
+        self.string_table.push(s.to_owned());
+        idx
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        // Estimate size
+        let mut buf = Vec::with_capacity(
+            20 + self.columns.len() * 40
+                + self.string_table.iter().map(|s| s.len() + 4).sum::<usize>()
+                + self.cell_buf.len(),
+        );
+
+        // Header: col_count(u32) + row_count(u32) + string_table_len(u32) + rows_affected(i64)
+        buf.extend_from_slice(&(self.cols_per_row as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.row_count as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.string_table.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.rows_affected.to_le_bytes());
+
+        // Column definitions: type_tag(u8) + name_len(u16) + name_bytes
+        for col in &self.columns {
+            buf.push(col_type_id(col.column_type()));
+            let name = col.name();
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+        }
+
+        // String table: len(u32) + bytes for each
+        for s in &self.string_table {
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+
+        // Cell data (already encoded)
+        buf.extend_from_slice(&self.cell_buf);
+
+        buf
+    }
+}
+
+impl RowWriter for FastRowCollector {
+    fn on_metadata(&mut self, columns: &[Column]) {
+        self.columns = columns.to_vec();
+        self.cols_per_row = columns.len();
+    }
+
+    fn write_null(&mut self, _col: usize) {
+        self.cell_buf.push(TAG_NULL);
+    }
+    fn write_bool(&mut self, _col: usize, v: bool) {
+        self.cell_buf.push(if v { TAG_TRUE } else { TAG_FALSE });
+    }
+    fn write_u8(&mut self, _col: usize, v: u8) {
+        self.cell_buf.push(TAG_F64);
+        self.cell_buf.extend_from_slice(&(v as f64).to_le_bytes());
+    }
+    fn write_i16(&mut self, _col: usize, v: i16) {
+        self.cell_buf.push(TAG_F64);
+        self.cell_buf.extend_from_slice(&(v as f64).to_le_bytes());
+    }
+    fn write_i32(&mut self, _col: usize, v: i32) {
+        self.cell_buf.push(TAG_F64);
+        self.cell_buf.extend_from_slice(&(v as f64).to_le_bytes());
+    }
+    fn write_i64(&mut self, _col: usize, v: i64) {
+        if v.unsigned_abs() <= (1u64 << 53) {
+            self.cell_buf.push(TAG_F64);
+            self.cell_buf.extend_from_slice(&(v as f64).to_le_bytes());
+        } else {
+            self.cell_buf.push(TAG_BIGINT);
+            self.cell_buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    fn write_f32(&mut self, _col: usize, v: f32) {
+        self.cell_buf.push(TAG_F64);
+        self.cell_buf.extend_from_slice(&(v as f64).to_le_bytes());
+    }
+    fn write_f64(&mut self, _col: usize, v: f64) {
+        self.cell_buf.push(TAG_F64);
+        self.cell_buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn write_str(&mut self, _col: usize, v: &str) {
+        let idx = self.intern_string(v);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn write_bytes(&mut self, _col: usize, v: &[u8]) {
+        self.cell_buf.push(TAG_BYTES);
+        self.cell_buf
+            .extend_from_slice(&(v.len() as u32).to_le_bytes());
+        self.cell_buf.extend_from_slice(v);
+    }
+    fn write_guid(&mut self, _col: usize, v: &[u8; 16]) {
+        let u = uuid::Uuid::from_bytes(*v);
+        let s = u.to_string();
+        let idx = self.intern_string(&s);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn write_decimal(&mut self, _col: usize, value: i128, _precision: u8, scale: u8) {
+        let s = crate::types::decimal_to_string(value, scale);
+        let idx = self.intern_string(&s);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn write_date(&mut self, _col: usize, unix_days: i32) {
+        let s = crate::types::unix_days_to_iso(unix_days);
+        let idx = self.intern_string(&s);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn write_time(&mut self, _col: usize, nanos: i64) {
+        let s = crate::types::nanos_to_time_str(nanos as u64);
+        let idx = self.intern_string(&s);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn write_datetime(&mut self, _col: usize, micros: i64) {
+        let s = crate::types::micros_to_iso(micros);
+        let idx = self.intern_string(&s);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn write_datetimeoffset(&mut self, _col: usize, micros: i64, offset_minutes: i16) {
+        let s = crate::types::micros_offset_to_iso(micros, offset_minutes);
+        let idx = self.intern_string(&s);
+        self.cell_buf.push(TAG_STRING_REF);
+        self.cell_buf.extend_from_slice(&idx.to_le_bytes());
+    }
+    fn on_done(&mut self, rows: u64) {
+        self.rows_affected = rows as i64;
+        self.row_count = rows as usize;
+    }
+}
+
+fn col_type_id(ct: ColumnType) -> u8 {
+    match ct {
+        ColumnType::Null => 0,
+        ColumnType::Bit | ColumnType::Bitn => 1,
+        ColumnType::Int1 => 2,
+        ColumnType::Int2 => 3,
+        ColumnType::Int4 => 4,
+        ColumnType::Int8 => 5,
+        ColumnType::Intn => 6,
+        ColumnType::Float4 => 7,
+        ColumnType::Float8 => 8,
+        ColumnType::Floatn => 9,
+        ColumnType::Datetime
+        | ColumnType::Datetime2
+        | ColumnType::Datetime4
+        | ColumnType::Datetimen => 10,
+        ColumnType::DatetimeOffsetn => 11,
+        ColumnType::Daten => 12,
+        ColumnType::Timen => 13,
+        ColumnType::Decimaln | ColumnType::Numericn => 14,
+        ColumnType::Guid => 15,
+        ColumnType::NVarchar | ColumnType::NChar | ColumnType::NText => 16,
+        ColumnType::BigVarChar | ColumnType::BigChar | ColumnType::Text => 17,
+        ColumnType::BigVarBin | ColumnType::BigBinary | ColumnType::Image => 18,
+        ColumnType::Xml => 19,
+        ColumnType::Money | ColumnType::Money4 => 20,
+        ColumnType::Udt => 21,
+        ColumnType::SSVariant => 22,
+    }
+}
+
+#[allow(dead_code)]
+static COL_TYPE_NAMES: &[&str] = &[
+    "null",
+    "bit",
+    "tinyint",
+    "smallint",
+    "int",
+    "bigint",
+    "int",
+    "real",
+    "float",
+    "float",
+    "datetime",
+    "datetimeoffset",
+    "date",
+    "time",
+    "decimal",
+    "uniqueidentifier",
+    "nvarchar",
+    "varchar",
+    "varbinary",
+    "xml",
+    "money",
+    "udt",
+    "sql_variant",
+];
+
 // ── QueryResult: returned to JS ────────────────────────────────────
 #[napi(object)]
 pub struct QueryResult {
@@ -431,6 +667,39 @@ impl Client {
     #[napi]
     pub async fn end(&self) -> Result<()> {
         self.close().await
+    }
+
+    /// Fast query returning binary-encoded buffer for JS-side decoding
+    #[napi]
+    pub async fn query_raw(
+        &self,
+        sql: String,
+        params: Option<Vec<JsValueWrapper>>,
+    ) -> Result<Buffer> {
+        let inner = self.inner.clone();
+        let mut guard = inner.lock().await;
+        let client = guard
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Not connected. Call connect() first."))?;
+
+        let mut writer = FastRowCollector::default();
+
+        let final_sql = if let Some(ref p) = params {
+            if p.is_empty() {
+                sql.clone()
+            } else {
+                substitute_params(&sql, p)?
+            }
+        } else {
+            sql.clone()
+        };
+
+        client
+            .batch_into(&final_sql, &mut writer)
+            .await
+            .map_err(|e| Error::from_reason(format!("Query failed: {e}")))?;
+
+        Ok(writer.encode().into())
     }
 }
 
