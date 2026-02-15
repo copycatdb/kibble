@@ -1,0 +1,33 @@
+{
+  "name": "@copycatdb/kibble",
+  "version": "0.1.0",
+  "description": "Fast Node.js driver for SQL Server. Powered by tabby (Rust TDS).",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "napi build --release --platform",
+    "build:debug": "napi build --platform",
+    "test": "vitest run",
+    "bench": "node benchmarks/bench_vs_tedious.mjs"
+  },
+  "napi": {
+    "name": "kibble",
+    "triples": {
+      "defaults": true
+    }
+  },
+  "keywords": ["sql-server", "mssql", "tds", "database", "driver", "native"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/copycatdb/kibble"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "vitest": "^3.0.0",
+    "tedious": "^19.0.0"
+  },
+  "engines": {
+    "node": ">= 18"
+  }
+}

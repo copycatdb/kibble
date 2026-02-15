@@ -1,0 +1,22 @@
+[package]
+name = "kibble"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", features = ["async", "napi9"] }
+napi-derive = "2"
+tabby = { git = "https://github.com/copycatdb/tabby.git", branch = "main", default-features = false, features = ["rustls", "chrono", "rust_decimal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+strip = true
